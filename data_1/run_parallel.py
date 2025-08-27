@@ -3,25 +3,55 @@ import os
 import sys
 import shutil
 import subprocess
+import time
 from pathlib import Path
 import pandas as pd
 
 # ========== SIMPLE CONFIG ==========
-BASE_DIR        = Path(".")            # current folder where you run the script
-SCRIPT_FILENAME = "modifier_1_0.py"    # your existing script (unchanged)
+BASE_DIR        = Path(".")            # run from data_1 folder
+SCRIPT_FILENAME = "modifier_1_0.py"    # your existing script
 INPUT_NAME      = "data_1_0.csv"
 OUTPUT_NAME     = "data_1_1.csv"
 REPORT_NAME     = "data_1_0_changes.csv"
-NUM_WORKERS     = 3
+NUM_WORKERS     = 5                    # ← five shards
 
-# Optional: override env vars your script reads (no need to change the script)
+# Optional: override env vars your script reads (no script edits needed)
 SCRIPT_ENV_OVERRIDES = {
-    # "BATCH_SIZE": "15",
-    # "PAUSE": "0.4",
-    # "RETRIES": "5",
-    # "READ_TIMEOUT_SEC": "45",
+    # Safer defaults when parallel:
+    "BATCH_SIZE": "15",          # smaller batches per worker
+    "PAUSE": "0.6",              # slightly longer backoff inside your script
+    "RETRIES": "8",              # per-batch retries inside your script
+    "READ_TIMEOUT_SEC": "90",    # longer HTTP read timeout
 }
+# Backoff for restarting whole workers if the process exits non-zero
+RESTART_BACKOFF_BASE_SEC = 20       # initial wait
+RESTART_BACKOFF_FACTOR   = 1.6      # exponential growth
+RESTART_BACKOFF_CAP_SEC  = 300      # max 5 minutes between restarts
 # ===================================
+
+
+def copy_env_if_present(src_dir: Path, dst_dir: Path):
+    """Copy a .env into the shard dir if we find one nearby."""
+    for cand in [src_dir / ".env", Path(".") / ".env", Path("..") / ".env"]:
+        if cand.exists():
+            shutil.copy2(cand, dst_dir / ".env")
+            return cand
+    return None
+
+
+def launch_worker(shard_id: int, shard_dir: Path, env: dict):
+    """Start one worker process with unbuffered output into its own log."""
+    log_path = shard_dir / "logs" / f"worker_{shard_id}.log"
+    logf = open(log_path, "a", encoding="utf-8")
+    print(f"[info] Starting worker {shard_id} in {shard_dir} → log {log_path}")
+    p = subprocess.Popen(
+        [sys.executable, "-u", SCRIPT_FILENAME],
+        cwd=str(shard_dir),
+        env=env,
+        stdout=logf,
+        stderr=subprocess.STDOUT,
+    )
+    return p, logf, log_path
 
 
 def main():
@@ -66,49 +96,85 @@ def main():
 
         shutil.copy2(script_path, shard_dir / SCRIPT_FILENAME)
 
+        # Optional: copy .env so load_dotenv() finds your keys
+        found_env = copy_env_if_present(base_dir, shard_dir)
+        if found_env:
+            print(f"[info] Copied .env from {found_env} → {shard_dir / '.env'}")
+
         shard_input = shard_dir / INPUT_NAME
         shard_df.to_csv(shard_input, index=False)
         print(f"[info] Wrote input for shard {w} → {shard_input}")
 
         (shard_dir / "logs").mkdir(exist_ok=True)
 
-    # Launch workers
-    procs = []
+    # Launch & supervise workers with auto-restart
+    # We keep retrying a shard process until it finishes with rc==0
+    active = {}
     for w, shard_dir in enumerate(workdirs):
         env = os.environ.copy()
         env.update(SCRIPT_ENV_OVERRIDES)
         env["EVA_SHARD_ID"] = str(w)
-        env["PYTHONUNBUFFERED"] = "1"  # live logs
+        env["PYTHONUNBUFFERED"] = "1"
 
-        log_path = shard_dir / "logs" / f"worker_{w}.log"
-        print(f"[info] Starting worker {w} in {shard_dir} → log {log_path}")
-        logf = open(log_path, "w", encoding="utf-8")
-        p = subprocess.Popen(
-            [sys.executable, "-u", SCRIPT_FILENAME],
-            cwd=str(shard_dir),
-            env=env,
-            stdout=logf,
-            stderr=subprocess.STDOUT,
-        )
-        procs.append((w, p, logf))
+        p, logf, log_path = launch_worker(w, shard_dir, env)
+        active[w] = {
+            "env": env,
+            "dir": shard_dir,
+            "proc": p,
+            "logf": logf,
+            "log_path": log_path,
+            "attempt": 1,
+            "backoff": RESTART_BACKOFF_BASE_SEC,
+        }
 
-    # Wait for completion
-    failed = []
-    for w, p, logf in procs:
-        print(f"[info] Waiting for worker {w} (pid={p.pid}) ...")
-        rc = p.wait()
-        logf.close()
-        print(f"[info] Worker {w} finished with code {rc}")
-        if rc != 0:
-            failed.append(w)
+    # Wait loop: restart failed workers until they succeed
+    failed_any = False
+    while active:
+        # Pull a snapshot to iterate
+        for w in list(active.keys()):
+            rec = active[w]
+            p = rec["proc"]
+            rc = p.poll()
+            if rc is None:
+                continue  # still running
 
-    if failed:
-        print("\n[error] Some workers failed:")
-        for w in failed:
-            print(f" - worker {w} (see {base_dir / f'shard_{w}' / 'logs' / f'worker_{w}.log'})")
-        sys.exit(2)
+            # closed; flush/close log handle
+            rec["logf"].flush()
+            rec["logf"].close()
+            if rc == 0:
+                print(f"[info] Worker {w} finished OK")
+                del active[w]
+            else:
+                failed_any = True
+                attempt = rec["attempt"]
+                backoff = rec["backoff"]
+                print(f"[warn] Worker {w} exited with code {rc} (attempt {attempt}). "
+                      f"Restarting in {int(backoff)}s. See log: {rec['log_path']}")
 
-    print("[info] All workers finished successfully, merging outputs...")
+                try:
+                    time.sleep(backoff)
+                except KeyboardInterrupt:
+                    print("\n[info] Interrupted during backoff; exiting.")
+                    sys.exit(130)
+
+                # Exponential backoff with cap
+                rec["attempt"] += 1
+                rec["backoff"] = min(int(backoff * RESTART_BACKOFF_FACTOR), RESTART_BACKOFF_CAP_SEC)
+
+                # Reopen log in append mode and relaunch
+                env = rec["env"]
+                p, logf, log_path = launch_worker(w, rec["dir"], env)
+                rec["proc"] = p
+                rec["logf"] = logf
+                rec["log_path"] = log_path
+
+        # Avoid busy loop
+        time.sleep(1)
+
+    if failed_any:
+        print("[info] Some shards needed restarts but all finished successfully.")
+
+    print("[info] All workers finished, merging outputs...")
 
     # Merge outputs
     merged_out_parts = []
